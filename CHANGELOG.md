@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Design spec: session store ([documentation/specs/2026-09-28-session-store-design.md](./documentation/specs/2026-09-28-session-store-design.md)).** Draft design for a local, session-id-keyed capture store: sessions bounded by `/clear` (canary-verified to mint a new session id), segments cut at compaction (sealed at PreCompact, committed at SessionStart `compact`), best-effort clear lineage, a data model for every file in the store (event envelope, lifecycle and activity event kinds, `session.json` / `segment.json` projections, segment summary artifact, deterministic rollup, export cursors), a detached per-segment `claude -p` summarizer, readers as `/claudna:session` verbs, and an export door Claudron can optionally pull from. Spec only; no code ships.
+
 ### Security
 - **The find-skills and neon skills pin every `npx` package they tell an agent to run ([Claudlobby#1890](https://github.com/Claudfather/Claudlobby/issues/1890)).** 31 lines ran `npx skills …` or `npx neon …` with no version, so a future bad publish of either package would run on the agent's next call. Each now names the version npm serves today, checked with `npm view <pkg>@<version> version` and never by running it: `skills@1.7.0` (vercel-labs/skills, 14 lines in `find-skills`) and `neon@6.2.3` (Neon's own CLI from neondatabase/neon-pkgs, 17 lines across the neon skill's `SKILL.md`, `branch.md` and `info.md`). The same package at its current version changes nothing; an upgrade is now an explicit edit. The two sentences that told an agent to add or drop an `npx` prefix now name the pinned command and the bare `neon` in its place. `find-skills`' frontmatter `cli: npx` is a requirement, not a launch, and is unchanged.
 
