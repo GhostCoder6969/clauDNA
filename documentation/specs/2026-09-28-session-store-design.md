@@ -13,11 +13,26 @@ repos: [claudna, claudron, claudlobby]
 clauDNA captures nothing locally about what a session did. `telemetry-emit.sh` writes an unbounded, opt-in JSONL of skill calls; `/claudna:capture` distills knowledge straight into the vault; failures, boundaries, and "what happened in this task" are lost when the session closes. Two workloads need the same substrate:
 
 - **Interactive work** — one session per task, then close out. Wants a per-session record with readers, and an end-of-session summary.
-- **Claudlobby workers** — long-running, never bounded by a task, kept alive by manager-issued `/clear` and by compaction. Wants the same record, cut into bounded pieces a harvester can take incrementally.
+- **Claudlobby workers** — long-running interactive `claude` in tmux, never resumed. Workers `/compact` themselves after every task and `/clear` themselves when switching repos; the manager can only *request* a compact; a restart relaunches the process (new session, no clear). Wants the same record, cut into bounded pieces — for a bot, a segment is ≈ one task.
 
-**Goal:** a local, append-only, session-id-keyed store that clauDNA writes and organizes, with readers, a per-segment `claude -p` summary, and an export door that Claudron *optionally* pulls from.
+**Goal:** a local, append-only, session-id-keyed store that clauDNA writes and organizes, with readers, a per-segment `claude -p` summary, and an export door that Claudron and Claudlobby *optionally* pull from.
 
-**Non-goals:** fleet metrics (tokens / cost / latency — Claude Code's OpenTelemetry export, configured by Claudlobby); pushing to any hosted service; vault writes (Claudron owns ingestion, dedup, ranking).
+**Non-goals:** fleet metrics (tokens / cost / latency — Claude Code's OpenTelemetry export, Claudlobby's to configure; a design-stage pilot there today); pushing to any hosted service; vault writes (Claudron owns ingestion, dedup, ranking); anything the Claudlobby plane already records (§1.1).
+
+### 1.1 Boundary with Claudlobby and Claudron
+
+| Layer | Owner | Scope | Answers |
+|---|---|---|---|
+| Inter-agent / fleet | **Claudlobby plane** (`state/plane/plane.db`, SQLite) | host, all bots | who asked whom to do what, did it land, is the bot healthy |
+| Intra-session | **clauDNA session store** (this spec) | one session, cut into segments | what happened inside this session/segment, what broke, what it learned |
+| Durable knowledge | **Claudron** vault | fleet / user | what's worth keeping |
+
+Rules:
+
+1. **A fact is recorded once, by whoever observes it first-hand.** The plane's `bot-vitals.sh` already records every tool call (`tool_call`), so the store records **no generic tool-call event**. It records only what the plane lacks: `tool.failed` (vitals hooks PostToolUse, not failures — a gap today), `skill.invoked`, prompt metadata, and segment boundaries. Interactive sessions have no plane, which is why the store stands alone.
+2. **Neither side writes the other's storage.** clauDNA never touches `plane.db`; the plane never parses the store's files. Claudlobby consumes `session export` like Claudron does (a `consumers.json` entry) and joins on `sess_<sha256(sid)[:32]>`.
+3. **Claudlobby owns per-bot config; clauDNA reads it.** `CLAUDNA_STATE_DIR` (per bot, e.g. `$BOT_DIR/data/claudna`), `CLAUDNA_SESSION_SUMMARY`, and identity env (`FLEET_NAME`, `BOT_ID`).
+4. **Run siloed, then consolidate.** Claudlobby's `transcript-digest.sh` (a SessionEnd `claude -p` digest using capture's rubric) overlaps this spec's summarizer. For an observation period both run, siloed, on a small set of bots; one owner is then chosen on evidence (quality, cost, coverage including the skipped rows the plane's monitor needs). Tracked in [Claudlobby#1961](https://github.com/Claudfather/Claudlobby/issues/1961), which also covers the digest child's missing isolation.
 
 **Prior art, used as concept reference only:** artemis-skills' session capture (per-session dirs, `failures.jsonl`, a detached `claude -p` summarizer, a field-merge map). This design takes the *concepts* and rebuilds from first principles; nothing is ported.
 
@@ -72,7 +87,7 @@ A segment is a contiguous byte range of the session's transcript. A session with
 | SessionStart `clear` | `session.opened` with `parent_sid` from the clear link (§4.3); `segment.opened` |
 | UserPromptSubmit | `prompt.submitted` (segment events) |
 | PostToolUse (Skill) | `skill.invoked` |
-| PostToolUse (error result) | `tool.failed` |
+| PostToolUseFailure | `tool.failed` (failing calls fire this event, not PostToolUse, and only it carries the error field) |
 | PreCompact | `segment.sealed` — record end offset; start summarizer on that range. Idempotent: a second PreCompact (first was blocked) re-seals with the later offset. |
 | SessionStart `compact` | `segment.opened` for index N+1, start = last seal offset. If no seal exists (missed PreCompact), seal first at current transcript size. |
 | SessionEnd | `segment.sealed` (final); `session.closed`; start summarizer; on `reason=clear` write the clear link. |
@@ -85,7 +100,22 @@ A segment is a contiguous byte range of the session's transcript. A session with
 
 SessionEnd(`reason=clear`) writes `links/<claude-pid>.json` naming the ending session. The next SessionStart(`source=clear`) from the same pid consumes it (reads, then deletes) and records `parent_sid`. The parent's `session.json` learns its child through a `session.child_linked` event appended to the parent's log. A link older than 60 s is ignored (stale). If no link is found, `parent_sid` is `null` — lineage is best-effort, never guessed.
 
-Worker identity across a chain of clears is `actor.bot_name` (from `BOT_NAME`, already used by `telemetry-emit.sh`); lineage gives order within it.
+Worker identity across a chain of sessions is `(actor.fleet, actor.bot_id)`. Clear links order sessions within a repo switch; restarts (process relaunch, SessionEnd without `reason=clear`) produce unlinked sessions, ordered by `opened_at` within the same bot. The store never guesses a `parent_sid` for a restart.
+
+### 4.4 Hook stacking — a new role, not a contested one
+
+#203 ruled that SessionEnd is Claudron's (`R-sync`) and "clauDNA adds no SessionEnd hook". The rule's purpose was that no role is duplicated. Claude Code fires every registered hook for an event, so co-registration is mechanically fine; what matters is roles. This spec adds a fifth role to Claudron's session-loop table rather than contesting one:
+
+| Role | Content class | Owner | Events |
+|---|---|---|---|
+| `R-record` — the session store: boundaries, activity, segment summaries | behavior | **The front-end (clauDNA).** | SessionStart, PreCompact, PostToolUseFailure, UserPromptSubmit, SessionEnd |
+
+`R-record` holds four invariants, so it can never collide with `R-sync` or `R-capture-prompt`:
+
+1. **Never touches the vault or git.** No `claudron` call, no sync, no capture from any store hook — so there is no race with Claudron's bounded `sync --push` at SessionEnd. Claudron reaches the store only by pulling through `session export`, on its own schedule.
+2. **Never prompts, never blocks, emits no stdout.** The store's PreCompact handler is separate from `precompact-reflect.sh` (which holds `R-capture-prompt`) and only records a seal.
+3. **Returns in < 100 ms.** Anything heavier (the summarizer) detaches. Claude Code does not reliably wait for SessionEnd hooks, so a slow hook is a lost one.
+4. **Silent in children.** Exits 0 immediately under `CLAUDNA_SESSION_CHILD=1` (and Claudlobby's child marker), so no `claude -p` child records into — or summarizes — its parent.
 
 ## 5. Layout
 
@@ -123,7 +153,7 @@ Schemas ship as JSON Schema (draft 2020-12) in `schemas/session-store/`, one fil
 | `SegIndex` | integer ≥ 1; directory name `seg-%03d` (widens past 999 without breaking sort for readers that parse the int) |
 | `ByteRange` | `{ "start": int ≥ 0, "end": int ≥ start \| null }` — `end: null` means open |
 | `TranscriptRef` | `{ "path": string, "range": ByteRange, "sha256": string \| null }` — hash over the range, set at seal |
-| `Actor` | `{ "kind": "interactive" \| "headless" \| "bot", "bot_name": string \| null, "model": string \| null, "entrypoint": string \| null }` |
+| `Actor` | `{ "kind": "interactive" \| "headless" \| "bot", "fleet": string \| null, "bot_id": string \| null, "bot_name": string \| null, "model": string \| null, "entrypoint": string \| null }` — `fleet`/`bot_id` from `FLEET_NAME`/`BOT_ID`, matching the plane's `bot:<fleet>/<BOT_ID>` alias |
 | `Origin` | `{ "cwd": string, "repo": string \| null, "branch": string \| null, "head": string \| null }` — repo = `owner/name` from the git remote |
 | `Text` | scrubbed string, capped per field (caps listed where used); `null` when capture is off |
 
@@ -287,7 +317,7 @@ A pure function of `(segment range, prior rollup) → segment summary`, run out 
 - **Input:** the segment's transcript range, reduced to user/assistant prose (tool I/O dropped), with injected context blocks stripped and the text framed as untrusted data. The prior rollup is included as context so segment 5 knows what segments 1–4 did.
 - **Idempotent:** skips if a `done` artifact already has the same `input.sha256`.
 - **Gates:** skipped (`summary.status: skipped`) if the session is private, if `CLAUDNA_SESSION_SUMMARY=0`, or if the segment is trivially small (no prompts).
-- **Default:** on for interactive sessions; Claudlobby sets `CLAUDNA_SESSION_SUMMARY` per bot (a fleet that compacts often pays per segment).
+- **Default:** on for interactive sessions; **off for headless (`claude -p`) sessions** — every script, CI job, and other tool's `claude -p` would otherwise spawn a Haiku call at exit. Claudlobby sets `CLAUDNA_SESSION_SUMMARY` per bot (bots compact after every task, so they pay per task).
 
 ## 8. Readers and the export door
 
@@ -331,8 +361,9 @@ Returns an envelope: `{ schema: "claudna.export/1", items: [{ sid, seg, session:
 2. **Prompt text capture** — off by default (§6.2). On for interactive, off for bots?
 3. **Compact offset canary** — confirm PreCompact's transcript size equals the offset where post-compact content begins.
 4. **Pid stability across `/clear`** — the clear link (§4.3) assumes the same `claude` pid; confirm with a hook that records the `claude` pid, not the hook shell's.
-5. **Nested session-id inheritance** — observed in a cloud container; test on a plain machine. Claudlobby should spawn workers with an explicit `--session-id` regardless.
+5. **Nested session-id inheritance** — observed in a cloud container; test on a plain machine. Bot workers are unaffected (Claudlobby never resumes; every launch is fresh), but every `claude -p` *child* — ours and Claudlobby's digest — gets an explicit `--session-id` and a hook-suppression marker ([Claudlobby#1961](https://github.com/Claudfather/Claudlobby/issues/1961)).
 6. **Claudron pull verb** — Claudron-side work; this spec defines only the door it calls.
+7. **#203 re-ratification** — §4.4 adds a SessionEnd hook, reversing #203's "clauDNA adds no SessionEnd hook". Needs a sign-off in clauDNA and a matching amendment to Claudron's session-loop role table.
 
 ## 12. Phasing
 
